@@ -1,3 +1,4 @@
+import os
 import random
 import numpy as np
 import streamlit as st
@@ -5,7 +6,12 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from gtts import gTTS
 
-from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
+from moviepy.editor import (
+    ImageClip,
+    AudioFileClip,
+    concatenate_videoclips,
+    concatenate_audioclips,
+)
 
 
 # ---------- PIL: TEXT -> IMAGE ----------
@@ -40,6 +46,7 @@ def make_text_frame(text, w=1080, h=1920, font_size=95, margin=80, line_gap=20):
     if current:
         lines.append(current)
 
+    # center vertically
     line_heights = []
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
@@ -60,7 +67,7 @@ def make_text_frame(text, w=1080, h=1920, font_size=95, margin=80, line_gap=20):
     return np.array(img)
 
 
-# ---------- PIL: SAFE ZOOM (NO MOVIEPY RESIZE) ----------
+# ---------- PIL: SAFE ZOOM ----------
 def zoom_frame_pil(frame_np, zoom_factor, w, h):
     if zoom_factor <= 1.0:
         return frame_np
@@ -78,34 +85,48 @@ def zoom_frame_pil(frame_np, zoom_factor, w, h):
     return np.array(img)
 
 
-# ---------- BUILD VIDEO ----------
-def build_video(lines, total_duration, w, h, font_size, fps):
-    clip_len = total_duration / len(lines)
+# ---------- gTTS per line ----------
+def make_line_audio(text, filename, lang="en"):
+    tts = gTTS(text=text, lang=lang)
+    tts.save(filename)
+    return filename
 
-    clips = []
-    for t in lines:
-        frame = make_text_frame(t, w=w, h=h, font_size=font_size)
 
+# ---------- BUILD PERFECTLY SYNCED VIDEO ----------
+def build_synced_video(lines, w, h, font_size, fps, lang="en"):
+    video_clips = []
+    audio_clips = []
+
+    os.makedirs("tts", exist_ok=True)
+
+    for i, line in enumerate(lines):
+        # 1) Generate line audio
+        audio_path = f"tts/line_{i}.mp3"
+        make_line_audio(line, audio_path, lang=lang)
+
+        audio = AudioFileClip(audio_path)
+
+        # 2) Make the frame
+        frame = make_text_frame(line, w=w, h=h, font_size=font_size)
         zoom = random.uniform(1.00, 1.06)
         frame = zoom_frame_pil(frame, zoom, w, h)
 
-        clip = ImageClip(frame).set_duration(clip_len)
-        clips.append(clip)
+        # 3) Clip duration matches the audio duration (perfect sync)
+        clip = ImageClip(frame).set_duration(audio.duration).set_audio(audio)
 
-    final = concatenate_videoclips(clips, method="compose")
+        video_clips.append(clip)
+        audio_clips.append(audio)
+
+    final = concatenate_videoclips(video_clips, method="compose")
+    final_audio = concatenate_audioclips(audio_clips)
+
+    final = final.set_audio(final_audio)
     return final
 
 
-# ---------- GENERATE VOICEOVER ----------
-def generate_voiceover(text, out_mp3="vo.mp3", lang="en"):
-    tts = gTTS(text=text, lang=lang)
-    tts.save(out_mp3)
-    return out_mp3
-
-
 # ---------- STREAMLIT UI ----------
-st.set_page_config(page_title="Quick Cuts Video + Voiceover", layout="centered")
-st.title("Quick Cuts Text Video + AI Voiceover")
+st.set_page_config(page_title="Synced Text Video + Voice", layout="centered")
+st.title("Text Video + Voiceover (Perfect Sync)")
 
 default_script = """This AI tool is insane.
 One prompt.
@@ -113,21 +134,16 @@ Done.
 Try it today."""
 
 script = st.text_area("Script (ONE line per cut)", value=default_script, height=220)
-
-total_duration = st.slider("Total duration (seconds)", 8.0, 15.0, 10.0, 0.5)
 font_size = st.slider("Font size", 50, 140, 95, 5)
 
 format_choice = st.selectbox(
     "Video Format",
-    ["Vertical (1080x1920)", "Square (1080x1080)", "Horizontal (1920x1080)"]
+    ["Vertical (1080x1920)", "Square (1080x1080)", "Horizontal (1920x1080)"],
 )
 
 fps = st.selectbox("FPS", [24, 30, 60], index=1)
 
-# VO settings
-st.subheader("Voiceover")
-use_vo = st.toggle("Generate voiceover", value=True)
-vo_lang = st.selectbox("Voice language", ["en"], index=0)
+lang = st.selectbox("Voice language", ["en"], index=0)
 
 if format_choice == "Vertical (1080x1920)":
     w, h = 1080, 1920
@@ -136,57 +152,29 @@ elif format_choice == "Square (1080x1080)":
 else:
     w, h = 1920, 1080
 
-
 if st.button("Generate MP4"):
     lines = [l.strip() for l in script.split("\n") if l.strip()]
     if not lines:
         st.error("Enter at least 1 line.")
         st.stop()
 
-    st.write(f"Lines: {len(lines)}")
-    st.write(f"Each cut: {total_duration / len(lines):.2f} sec")
+    out_path = "synced_video.mp4"
 
-    out_path = "final_video.mp4"
-
-    with st.spinner("Rendering video..."):
-        video = build_video(lines, total_duration, w, h, font_size, fps)
-
-        if use_vo:
-            vo_text = " ".join(lines)
-            vo_path = generate_voiceover(vo_text, out_mp3="vo.mp3", lang=vo_lang)
-
-            audio = AudioFileClip(vo_path)
-
-            # Fit audio to video length (trim or loop)
-            if audio.duration > video.duration:
-                audio = audio.subclip(0, video.duration)
-            else:
-                audio = audio.audio_loop(duration=video.duration)
-
-            video = video.set_audio(audio)
-
-            video.write_videofile(
-                out_path,
-                fps=fps,
-                codec="libx264",
-                audio_codec="aac",
-                verbose=False,
-                logger=None,
-            )
-        else:
-            video.write_videofile(
-                out_path,
-                fps=fps,
-                codec="libx264",
-                audio=False,
-                verbose=False,
-                logger=None,
-            )
+    with st.spinner("Generating TTS + rendering video..."):
+        final = build_synced_video(lines, w, h, font_size, fps, lang=lang)
+        final.write_videofile(
+            out_path,
+            fps=fps,
+            codec="libx264",
+            audio_codec="aac",
+            verbose=False,
+            logger=None,
+        )
 
     with open(out_path, "rb") as f:
         st.download_button(
             "Download MP4",
             data=f,
-            file_name="quick_cuts_with_voice.mp4",
+            file_name="synced_text_voice.mp4",
             mime="video/mp4",
         )
